@@ -8,7 +8,9 @@ muse.ai 外联审批（HITL 审批卡片）的全自动批准器：纯 Node.js �
 
 - muse.ai 里 Agent 每次访问新网站都要手动点审批，想彻底解放双手
 - 默认策略：`allow_always + destination_domain`——新域名首次自动永久放行，落库为 durable 规则，以后不再弹窗
-- 个别单被服务端明确拒绝时回退为 `allow_once`；`deny_*` 失败永远不会回退成批准；`--decision` 拼错直接报错退出
+- 个别单被服务端**明确拒绝**（HTTP 4xx/5xx、`{ok:false}`、rpc error）时回退为 `allow_once`；超时/断线这类结果未知的失败不回退，下一轮仍 pending 时按原决策重试
+- 回退只在 allow 类之间（`allow_always` / `allow_session` → `allow_once`）；`deny_*` 失败永远不会回退成批准
+- `--decision` 白名单：只接受 `allow_once` / `allow_session` / `allow_always` / `deny_once` / `deny_always`，拼错或缺值直接报错退出（退出码 2）
 - 也支持只看不批的演练模式（`--dry`）
 
 ## 运行要求
@@ -51,7 +53,10 @@ node muse-daemon.cjs           # 常驻守护（10 秒轮询 + allow_always + �
 - **怎么获取（正常情况不用你动手）**：首次启动时自动登录（邮箱 + 密码），程序从登录响应的 `Set-Cookie` 头里解析出 `hatch_sess` 自动写入。之后 daemon 每 5 分钟做一次 token 续期，30 天内跑过一次会话就一直有效；服务端轮换 cookie 后也会自动回写这个文件。
 - **手动获取（自动登录失败时的兜底）**：浏览器登录 muse.ai → 按 F12 → Application → Cookies → 找到 `.muse.ai` 域名下的 `hatch_sess` → 复制它的值 → 按上面格式手写 `data/cookies.json`（chmod 600）。
 - **安全**：这个文件等同于你的登录态，绝不提交、不外传，`data/` 已在 `.gitignore` 里排除。程序写它时一律 0600、原子写入；文件损坏时会自动重新登录。
-- **自动登录不会刷邮件**：只有确定的认证失败（cookie 缺失/损坏、401）才重登；两次自动登录至少隔 10 分钟并指数退避（封顶 6 小时）；连续 5 次失败写 `data/login.blocked` 熔断（daemon 退出码 3、keepalive 不再拉起），排查后运行 `node work/login-lib.cjs` 成功即解除。
+- **自动登录不会刷邮件**：只有确定的认证失败才重登——`cookies.json` 不存在/无 `hatch_sess`（`NO_SESSION`）、`cookies.json` 损坏（`BAD_COOKIES`）、token 端点或 `/api/session` 返回 401（`AUTH_FAILED`）。`token 403` 只算瞬时错误：重试 5 次后作废 vmId 缓存重新发现，不触发重登。
+- **节流 + 熔断**：两次自动登录至少隔 10 分钟，连续失败后间隔翻倍（20、40 分钟……封顶 6 小时），被节流时日志为 `auto_login_throttled`；状态存 `data/login-state.json`，重启进程也绕不过。连续 5 次失败写 `data/login.blocked` 熔断：daemon 以退出码 3 退出、keepalive 不再拉起、`--check` 会显示"已熔断"。
+- **解除熔断**：排查凭据/账号后运行 `node work/login-lib.cjs`（或 `node muse-daemon.cjs --smoke`），登录成功即自动清零失败计数并删除 `data/login.blocked`；也可以手动删掉该文件。凭据缺失/混用不出网、不计入失败。
+- 可调环境变量：`MUSE_LOGIN_MIN_GAP_MS`（默认 600000）、`MUSE_LOGIN_MAX_GAP_MS`（默认 21600000）、`MUSE_LOGIN_MAX_FAILS`（默认 5）。
 
 ## 常用命令
 
@@ -59,10 +64,20 @@ node muse-daemon.cjs           # 常驻守护（10 秒轮询 + allow_always + �
 node muse-daemon.cjs --once            # 巡检一次审批后退出
 node muse-daemon.cjs --once --dry      # 只看不批（演练；常驻守护在跑时也能用）
 node muse-daemon.cjs --decision allow_once  # 改策略：只批准本次，不永久放行
-node work/muse-rpc.cjs list            # 查看审批列表
-node work/muse-rpc.cjs decide <id> <decision>  # 手动决策一条
-node work/login-lib.cjs                # 强制重新登录
+node muse-daemon.cjs --no-fallback     # 关掉 allow_once 回退（默认开 --fallback-once）
+node work/muse-rpc.cjs list            # 查看审批列表（pending + 最近记录）
+node work/muse-rpc.cjs detail <id>     # 单条详情；history [cursor] 看历史
+node work/muse-rpc.cjs decide <id> <decision> [reason]  # 手动决策一条
+node work/login-lib.cjs                # 强制重新登录（成功即解除登录熔断）
 ```
+
+daemon 可选参数：`--loop <ms>`（默认 10000）、`--decision <值>`、`--scope <值>`（`allow_always` / `deny_always` 默认 `destination_domain`）、`--always`（= `allow_always + destination_domain`）、`--fallback-once` / `--no-fallback`、`--dry`。`--once` / `--once --dry` / `--check` 不碰 pid 文件，常驻守护在跑时也能用。
+
+注意：`muse-rpc.cjs decide` 是排障用的原样调用——不走白名单校验、不带 `always_scope`；要按 daemon 的形状批准请用 `node muse-daemon.cjs --once`。
+
+退出码：0 正常 / 1 致命错误 / 2 参数或凭据问题（`--decision` 非法、无凭据且无有效会话、凭据来源混用）/ 3 自动登录熔断。
+
+其他环境变量：`MUSE_PROXY`（代理）、`MUSE_VM_ID`（直接指定 vmId，否则读 `data/muse-config.json` 缓存或 `GET /api/session` 自动发现）、`MUSE_DATA_DIR` / `MUSE_LOG_DIR`（覆盖 `data/`、`log/` 位置，供离线测试用，平时不要设——`keepalive.sh` 始终只看项目根目录下的 `data/` 和 `log/`）。
 
 npm 快捷方式：`npm run check` / `npm start` / `npm run once` / `npm run smoke` / `npm run login` / `npm run list` / `npm test`（离线测试）
 
@@ -74,10 +89,25 @@ npm 快捷方式：`npm run check` / `npm start` / `npm run once` / `npm run smo
   ```
   */15 * * * * /bin/bash /abs/path/to/muse-auto-approve/keepalive.sh >/dev/null 2>&1
   ```
-  脚本自带可执行权限；会自己找 node（PATH → nvm 最高版本 → 常见安装位置，也可在 cron 行写 `NODE_BIN=/abs/path/to/node`）；cron 下没有 shell 环境变量，凭据请放 `data/credentials.json` 或项目根目录的 `.env`（chmod 600）。只认本目录的 daemon、`flock` 防并发，进程假死（心跳 30 分钟不更新）会被重拉。
+  cron 行用 `/bin/bash` 调用（脚本也自带可执行权限）。脚本会自己找 node：`NODE_BIN` → PATH 里的 `node` → nvm 最高版本（`~/.nvm/versions/node/*/bin/node`）→ `/usr/local/bin/node` 等，找不到时 `log/keepalive.log` 记 `node not found`，在 cron 行写 `NODE_BIN=/abs/path/to/node` 即可。cron 下没有 shell 环境变量：凭据请放 `data/credentials.json`，或项目根目录的 `.env`（`MUSE_USER=…`、`MUSE_PASSWORD=…`、`MUSE_PROXY=…`，chmod 600，已在 `.gitignore`；`.env` 只由 keepalive 读取，手动跑 `node muse-daemon.cjs` 不会读它）。只认本目录的 daemon（别处克隆、编辑器打开该文件、`--once`/`--check`/`--smoke`/`--dry` 都不算存活）；`flock` 防并发（无 flock 时退回 mkdir 锁）；进程在但心跳 `data/muse-daemon.heartbeat` 超过 30 分钟（`MUSE_KEEPALIVE_STALE_SEC`，默认 1800）没更新视为假死，杀掉重拉。拉起时以 `--loop 10000 --always --fallback-once` 启动，stdout 丢弃，stderr 进 `log/daemon-stderr.log`。存在 `data/muse-daemon.stop` 或 `data/login.blocked` 时按设计不拉起。
 - Windows：任务计划程序，程序填 `node.exe`，参数填 `muse-daemon.cjs`，起始位置填项目根目录，触发条件选登录时或启动时
 
-停止：在 `data/` 下建一个空文件 `muse-daemon.stop`，守护进程下轮自检时优雅退出，keepalive 也不会再拉起（恢复时删掉它）；或直接结束进程。
+停止：在 `data/` 下建一个空文件 `muse-daemon.stop`，守护进程下轮自检时优雅退出，keepalive 也不会再拉起（恢复时删掉它）；或结束 `data/muse-daemon.pid` 里的进程（SIGTERM）。
+
+日志：`log/daemon-log.ndjson`（守护）、`log/auto-approve-log.ndjson`（决策记录）、`log/daemon-stderr.log`，超过 10MB 自动裁到末尾 10MB（启动时和之后每小时检查）；`log/keepalive.log` 自限约 1MB。
+
+## 排障
+
+| 现象 | 原因 / 解决 |
+|---|---|
+| 退出码 3 / `data/login.blocked` | 连续登录失败熔断：查凭据和账号状态后 `node work/login-lib.cjs`，成功即解除 |
+| 日志 `auto_login_throttled` | 自动登录被节流（防刷验证码邮件），到时间会再试，不用处理 |
+| 日志 `connect_retry … NO_SESSION` 后紧跟 `auto_login_ok` | 正常自愈；若紧跟 `auto_login_error` 检查凭据 |
+| `token 403` | 网络/代理问题或 VM 换了（会自动作废 vmId 缓存重新发现），不会触发重登；检查 `MUSE_PROXY` |
+| 退出码 2 + 中文提示 | 无凭据且无有效会话、凭据来源混用，或 `--decision` 非法：按提示修正 |
+| keepalive 不拉起 | 看 `log/keepalive.log`：`node not found` 就在 cron 行设 `NODE_BIN`；有 stop / blocked 文件时按设计不拉起 |
+| `fetch failed` / 连不上 | 需要代理就设 `MUSE_PROXY`；在 Muse 沙盒里先确认"其他 TCP 连接"开关已开 |
+| `sodium-native 未安装` | 运行 `npm install` |
 
 ## 重要边界
 

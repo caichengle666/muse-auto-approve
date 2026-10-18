@@ -12,7 +12,8 @@
     "once": "node muse-daemon.cjs --once",
     "smoke": "node muse-daemon.cjs --smoke",
     "login": "node work/login-lib.cjs",
-    "list": "node work/muse-rpc.cjs list"
+    "list": "node work/muse-rpc.cjs list",
+    "test": "node --test test/*.test.cjs"
   },
   "dependencies": {
     "undici": "^7.30.0",

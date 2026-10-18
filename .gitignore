@@ -12,3 +12,13 @@ log/
 
 # 依赖
 node_modules/
+# 运行时状态 / 锁 / 临时文件
+data/login-state.json
+data/login.blocked
+data/*.heartbeat
+data/*.lock
+data/*.lock.d/
+data/.keepalive-blocked-noted
+data/*.tmp*
+# keepalive 读取的可选环境变量文件（可能含密码）
+.env

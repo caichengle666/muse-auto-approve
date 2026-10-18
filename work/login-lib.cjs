@@ -6,6 +6,7 @@
  *   1) 环境变量 MUSE_USER / MUSE_PASSWORD（MUSE_EMAIL 也可当邮箱用）
  *   2) data/credentials.json  { "email": "...", "password": "..." }
  *   两处都没有时抛 code=NO_CREDENTIALS 的友好错误（调用方负责提示用户）。
+ *   环境变量只配了一半、另一半来自文件时抛 code=MIXED_CREDENTIALS（避免拿错账号的密码反复尝试登录）。
  *
  * 链路（网络默认直连；设置 MUSE_PROXY 后全部经该代理）：
  *   POST /api/auth/native/restart                     -> csrf_token + password_encryption(公钥/keyId) + cookie 组
@@ -23,7 +24,8 @@ const { installProxy } = require('./proxy.cjs');
 installProxy();
 let sodi = null;
 try { sodi = require('sodium-native'); } catch { /* 缺失时在 buildBlob 里给出明确错误 */ }
-const { webcrypto, randomBytes } = require('crypto');
+const { webcrypto, randomBytes, createHash } = require('crypto');
+const path = require('path');
 
 const paths = require('./paths.cjs');
 const CRED_PATH = paths.CRED_PATH;
@@ -43,13 +45,19 @@ function resolveCredentials(opts = {}) {
       fileFound = true;
     } catch { /* 损坏的 credentials.json 视为不存在，由下方统一提示 */ }
   }
-  const email = opts.email || envE || fileE;
-  const password = opts.password || envP || fileP;
-  let source;
-  if (opts.email || opts.password) source = 'argument';
-  else if (envE && envP) source = 'env';
-  else if (fileE && fileP) source = 'file';
-  else source = 'mixed';
+  let source, email, password;
+  if (opts.email || opts.password) { source = 'argument'; email = opts.email || envE || fileE; password = opts.password || envP || fileP; }
+  else if (envE && envP) { source = 'env'; email = envE; password = envP; }
+  else if ((envE || envP) && (fileE || fileP)) {
+    // 邮箱和密码来自不同来源：很可能是错配（如换了账号只改了一处），不拿它去登录
+    const e = new Error(
+      '登录凭据来源混用：环境变量只设置了 ' + (envE ? 'MUSE_USER/MUSE_EMAIL' : 'MUSE_PASSWORD') + '，另一半来自 ' + CRED_PATH + '。\n' +
+      '请二选一：要么同时设置 MUSE_USER 和 MUSE_PASSWORD，要么清掉环境变量只用 credentials.json。'
+    );
+    e.code = 'MIXED_CREDENTIALS';
+    throw e;
+  }
+  else { source = 'file'; email = fileE; password = fileP; }
   if (!email || !password) {
     const e = new Error(
       '缺少登录凭据，无法自动登录。请任选其一配置后重试：\n' +
@@ -111,6 +119,7 @@ async function login(opts = {}) {
             'User-Agent': UA, ...(jar.size ? { Cookie: jarHeader() } : {}), ...extra,
           },
           body: typeof body === 'string' ? body : JSON.stringify(body ?? {}),
+          signal: AbortSignal.timeout(15000),   // 网络黑洞时不能永久挂起（否则 daemon 假死、keepalive 也发现不了）
         });
         break;
       } catch (e) { lastErr = e; await new Promise(r => setTimeout(r, 2000)); }
@@ -143,14 +152,17 @@ async function login(opts = {}) {
   let sess = null;
   for (const sc of cp.setCookies) { const m = /^hatch_sess=([^;]+)/.exec(sc); if (m && m[1]) sess = m[1]; }
   if (!sess) throw new Error('confirm-password ok but no hatch_sess returned');
-  log('login: confirm-password ok, got session (' + sess.slice(0, 36) + '...)');
+  log('login: confirm-password ok, got session (len=' + sess.length + ', sha256=' + createHash('sha256').update(sess).digest('hex').slice(0, 8) + ')');
 
   // 写入 cookies.json（文件不存在时自动创建；存在时备份旧值）
   let list = [];
   if (fs.existsSync(COOKIE_PATH)) {
     try {
       const cj = fs.readFileSync(COOKIE_PATH, 'utf8');
-      try { fs.writeFileSync(COOKIE_PATH + '.bak.' + Date.now(), cj); } catch {}
+      try {
+        paths.writeSecret(COOKIE_PATH + '.bak.' + Date.now(), cj);
+        paths.pruneBackups(path.dirname(COOKIE_PATH), path.basename(COOKIE_PATH) + '.bak.', 2);   // 只留最近 2 份
+      } catch {}
       const parsed = JSON.parse(cj);
       if (Array.isArray(parsed)) list = parsed;
     } catch {}
@@ -158,7 +170,7 @@ async function login(opts = {}) {
   let found = false;
   for (const c of list) if (c.name === 'hatch_sess') { c.value = sess; found = true; }
   if (!found) list.push({ name: 'hatch_sess', value: sess, domain: '.muse.ai', path: '/' });
-  fs.writeFileSync(COOKIE_PATH, JSON.stringify(list, null, 1));
+  paths.writeSecret(COOKIE_PATH, JSON.stringify(list, null, 1));   // 0600 + 原子写
 
   return { sess, frlAccountId: cp.json && cp.json.auth_meta_session && cp.json.auth_meta_session.frl_account_id, redirectTo: cp.json && cp.json.redirect_to, source: cred.source };
 }
@@ -167,9 +179,11 @@ module.exports = { login, buildBlob, resolveCredentials };
 
 if (require.main === module) {
   login({ log: console.log }).then(r => {
+    // 人工登录成功：清零自动登录的失败计数、解除熔断（data/login.blocked）
+    try { require('./login-guard.cjs').createLoginGuard().reset(); } catch {}
     console.log('LOGIN OK. source=' + r.source + ' frl_account_id =', r.frlAccountId, 'redirect_to =', r.redirectTo);
   }).catch(e => {
-    if (e.code === 'NO_CREDENTIALS') { console.error('\n' + e.message + '\n'); process.exit(2); }
+    if (e.code === 'NO_CREDENTIALS' || e.code === 'MIXED_CREDENTIALS') { console.error('\n' + e.message + '\n'); process.exit(2); }
     console.error('LOGIN FAIL:', e.message); process.exit(1);
   });
 }
